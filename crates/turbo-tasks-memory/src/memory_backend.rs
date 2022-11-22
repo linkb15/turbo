@@ -25,6 +25,7 @@ use turbo_tasks::{
 };
 
 use crate::{
+    cell::RecomputingCell,
     output::Output,
     scope::{TaskScope, TaskScopeId},
     task::{
@@ -136,7 +137,7 @@ impl MemoryBackend {
                 scope.state.lock().increment_active(&mut queue)
             }) {
                 turbo_tasks.schedule_backend_foreground_job(
-                    self.create_backend_job(Job::ScheduleWhenDirty(tasks, reason)),
+                    self.create_backend_job(Job::ScheduleWhenDirtyFromScope(tasks, reason)),
                 );
             }
         }
@@ -163,7 +164,7 @@ impl MemoryBackend {
             scope.state.lock().increment_active_by(count, &mut queue)
         }) {
             turbo_tasks.schedule_backend_foreground_job(
-                self.create_backend_job(Job::ScheduleWhenDirty(tasks, reason)),
+                self.create_backend_job(Job::ScheduleWhenDirtyFromScope(tasks, reason)),
             );
         }
         self.increase_scope_active_queue(queue, reason, turbo_tasks);
@@ -315,32 +316,75 @@ impl Backend for MemoryBackend {
 
     fn try_read_task_cell(
         &self,
-        task: TaskId,
+        task_id: TaskId,
         index: CellId,
         reader: TaskId,
-        _turbo_tasks: &dyn TurboTasksBackendApi,
+        turbo_tasks: &dyn TurboTasksBackendApi,
     ) -> Result<Result<CellContent, EventListener>> {
-        if task == reader {
-            Ok(Ok(self.with_task(task, |task| {
-                task.with_cell_mut(index, |cell| cell.read_content_untracked())
+        if task_id == reader {
+            Ok(Ok(self.with_task(task_id, |task| {
+                task.with_cell(index, |cell| cell.read_own_content_untracked())
             })))
         } else {
-            Task::add_dependency_to_current(TaskDependency::TaskCell(task, index));
-            Ok(Ok(self.with_task(task, |task| {
-                task.with_cell_mut(index, |cell| cell.read_content(reader))
-            })))
+            Task::add_dependency_to_current(TaskDependency::TaskCell(task_id, index));
+            self.with_task(task_id, |task| {
+                match task.with_cell_mut(index, |cell| {
+                    cell.read_content(
+                        reader,
+                        move || format!("{task_id} {index}"),
+                        move || format!("reading {} {} from {}", task_id, index, reader),
+                    )
+                }) {
+                    Ok(content) => Ok(Ok(content)),
+                    Err(RecomputingCell { listener, schedule }) => {
+                        if schedule {
+                            task.invalidate(
+                                "need garbagged collected data again",
+                                self,
+                                turbo_tasks,
+                            );
+                        }
+                        Ok(Err(listener))
+                    }
+                }
+            })
         }
+    }
+
+    fn try_read_own_task_cell_untracked(
+        &self,
+        current_task: TaskId,
+        index: CellId,
+        _turbo_tasks: &dyn TurboTasksBackendApi,
+    ) -> Result<CellContent> {
+        Ok(self.with_task(current_task, |task| {
+            task.with_cell(index, |cell| cell.read_own_content_untracked())
+        }))
     }
 
     fn try_read_task_cell_untracked(
         &self,
-        task: TaskId,
+        task_id: TaskId,
         index: CellId,
-        _turbo_tasks: &dyn TurboTasksBackendApi,
+        turbo_tasks: &dyn TurboTasksBackendApi,
     ) -> Result<Result<CellContent, EventListener>> {
-        Ok(Ok(self.with_task(task, |task| {
-            task.with_cell(index, |cell| cell.read_content_untracked())
-        })))
+        self.with_task(task_id, |task| {
+            match task.with_cell_mut(index, |cell| {
+                cell.read_content_untracked(
+                    move || format!("{task_id}"),
+                    move || format!("reading {} {} untracked", task_id, index),
+                )
+            }) {
+                Ok(content) => Ok(Ok(content)),
+                Err(RecomputingCell { listener, schedule }) => {
+                    println!("recomputing cell {task_id} {index} untracked");
+                    if schedule {
+                        task.invalidate("need garbagged collected data again", self, turbo_tasks);
+                    }
+                    Ok(Err(listener))
+                }
+            }
+        })
     }
 
     fn track_read_task_cell(
@@ -502,7 +546,7 @@ impl Backend for MemoryBackend {
 pub(crate) enum Job {
     RemoveFromScopes(AutoSet<TaskId>, Vec<TaskScopeId>),
     RemoveFromScope(AutoSet<TaskId>, TaskScopeId),
-    ScheduleWhenDirty(Vec<TaskId>, &'static str),
+    ScheduleWhenDirtyFromScope(AutoSet<TaskId>, &'static str),
     /// Add tasks from a scope. Scheduled by `run_add_from_scope_queue` to
     /// split off work.
     AddToScopeQueue(VecDeque<(TaskId, usize)>, TaskScopeId, bool, &'static str),
@@ -528,10 +572,10 @@ impl Job {
                     });
                 }
             }
-            Job::ScheduleWhenDirty(tasks, reason) => {
+            Job::ScheduleWhenDirtyFromScope(tasks, reason) => {
                 for task in tasks.into_iter() {
                     backend.with_task(task, |task| {
-                        task.schedule_when_dirty(reason, turbo_tasks);
+                        task.schedule_when_dirty_from_scope(reason, backend, turbo_tasks);
                     })
                 }
             }

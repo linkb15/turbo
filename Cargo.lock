@@ -6401,6 +6401,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "tokio",
+ "turbo-malloc",
  "turbo-tasks",
  "turbo-tasks-build",
  "turbo-tasks-hash",
