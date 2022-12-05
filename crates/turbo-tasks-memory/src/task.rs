@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Result;
 use auto_hash_map::{AutoMap, AutoSet};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use tokio::task_local;
 use turbo_tasks::{
     backend::{PersistentTaskType, TaskExecutionSpec},
@@ -28,6 +28,7 @@ use turbo_tasks::{
 use crate::{
     cell::Cell,
     count_hash_set::CountHashSet,
+    gc::GcTaskInfo,
     map_guard::{ReadGuard, WriteGuard},
     memory_backend::Job,
     output::Output,
@@ -124,6 +125,13 @@ impl Default for TaskMetaState {
 }
 
 impl TaskMetaState {
+    fn into_unwrap_full(self) -> TaskState {
+        match self {
+            Self::Full(state) => *state,
+            _ => panic!("TaskMetaState is not full"),
+        }
+    }
+
     fn into_unwrap_partial(self) -> PartialTaskState {
         match self {
             Self::Partial(state) => *state,
@@ -241,6 +249,14 @@ impl<'a> TaskMetaStateWriteGuard<'a> {
                 "TaskMetaStateWriteGuard::scopes_and_children must be called with at least a \
                  partial state"
             ),
+        }
+    }
+
+    fn into_inner(self) -> RwLockWriteGuard<'a, TaskMetaState> {
+        match self {
+            TaskMetaStateWriteGuard::Full(state) => state.into_inner(),
+            TaskMetaStateWriteGuard::Partial(state) => state.into_inner(),
+            TaskMetaStateWriteGuard::Unloaded(state) => state.into_inner(),
         }
     }
 }
@@ -407,6 +423,11 @@ impl MaybeCollectibles {
         self.inner.take()
     }
 
+    /// Consumes the collectibles (if any) and return them.
+    fn into_inner(self) -> Option<Box<Collectibles>> {
+        self.inner
+    }
+
     /// Returns a reference to the collectibles (if any).
     fn as_ref(&self) -> Option<&Collectibles> {
         if let Some(inner) = &self.inner {
@@ -512,6 +533,14 @@ impl Task {
             state: RwLock::new(TaskMetaState::Full(box TaskState::new_scheduled_in_scope(
                 id, scope, stats_type,
             ))),
+        }
+    }
+
+    pub(crate) fn is_pure(&self) -> bool {
+        match &self.ty {
+            TaskType::Persistent(_) => true,
+            TaskType::Root(_) => false,
+            TaskType::Once(_) => false,
         }
     }
 
@@ -1280,6 +1309,7 @@ impl Task {
         queue: &mut VecDeque<TaskId>,
     ) {
         let mut state = self.partial_state_mut();
+        let partial = matches!(state, TaskMetaStateWriteGuard::Partial(_));
         let (scopes, children) = state.scopes_and_children();
         match scopes {
             &mut TaskScopes::Root(root) => {
@@ -1290,14 +1320,60 @@ impl Task {
                         parent,
                     }) = backend.with_scope(id, |scope| scope.state.lock().remove_child(root))
                     {
-                        drop(state);
+                        if partial && parent {
+                            // We might be able to drop the root scope now
+                            // Check if this was the last parent that is removed
+                            // (We operate under the task lock to ensure no other thread is adding a
+                            // new parent)
+                            backend.with_scope(root, |child| {
+                                if child.remove_parent(id, backend) {
+                                    let stats_type = match &state {
+                                        TaskMetaStateWriteGuard::Full(s) => match s.stats {
+                                            TaskStats::Essential(_) => StatsType::Essential,
+                                            TaskStats::Full(_) => StatsType::Full,
+                                        },
+                                        TaskMetaStateWriteGuard::Partial(s) => s.stats_type,
+                                        TaskMetaStateWriteGuard::Unloaded(s) => s.stats_type,
+                                    };
+                                    if let TaskMetaState::Partial(state) = replace(
+                                        &mut *state.into_inner(),
+                                        TaskMetaState::Unloaded(UnloadedTaskState { stats_type }),
+                                    ) {
+                                        state.event.notify(usize::MAX);
+                                        child.decrement_tasks();
+                                        child.decrement_unfinished_tasks(backend);
+                                        let notify = {
+                                            // Partial tasks are always dirty
+                                            let mut child = child.state.lock();
+                                            child.remove_dirty_task(self.id);
+                                            child.take_all_dependent_tasks()
+                                        };
+                                        drop(state);
+                                        println!("unloading {} from {}", root, self.id);
+
+                                        turbo_tasks.schedule_notify_tasks_set(&notify);
+
+                                        // Now this root scope is eventually no longer referenced
+                                        // and we can unload it, once all foreground jobs are done
+                                        // since there might be ongoing add/remove scopes.
+                                        let job =
+                                            backend.create_backend_job(Job::UnloadRootScope(root));
+                                        turbo_tasks.schedule_backend_foreground_job(job);
+                                    } else {
+                                        unreachable!("partial is set so it must be Partial");
+                                    }
+                                }
+                            });
+                        } else {
+                            drop(state);
+                        }
                         if !notify.is_empty() {
                             turbo_tasks.schedule_notify_tasks_set(&notify);
                         }
                         if active {
                             backend.decrease_scope_active(root, turbo_tasks);
                         }
-                        if parent {
+                        if !partial && parent {
                             backend.with_scope(root, |child| {
                                 child.remove_parent(id, backend);
                             });
@@ -1311,7 +1387,20 @@ impl Task {
                         queue.reserve(max(children.len(), SPLIT_OFF_QUEUE_AT * 2));
                     }
                     queue.extend(children.iter().copied());
+                    let unset = set.is_unset();
                     self.remove_self_from_scope(&mut state, id, backend, turbo_tasks);
+                    if unset {
+                        if let TaskMetaStateWriteGuard::Partial(state) = state {
+                            state.event.notify(usize::MAX);
+                            let stats_type = state.stats_type;
+                            let mut state = state.into_inner();
+                            *state = TaskMetaState::Unloaded(UnloadedTaskState { stats_type });
+                        } else {
+                            drop(state);
+                        }
+                    } else {
+                        drop(state);
+                    }
                 }
             }
         }
@@ -1975,6 +2064,221 @@ impl Task {
                 .for_each(|e| tasks.extend(e.notify));
             drop(state);
             turbo_tasks.schedule_notify_tasks_set(&tasks);
+        }
+    }
+
+    pub(crate) fn gc_info(
+        &self,
+        now_relative_to_start: Duration,
+        backend: &MemoryBackend,
+    ) -> Option<GcTaskInfo> {
+        if !self.is_pure() {
+            return None;
+        }
+        if let TaskMetaStateReadGuard::Full(state) = self.state() {
+            if !matches!(state.state_type, Done { .. } | Dirty { .. }) {
+                return None;
+            }
+            let mut unread_cells = 0;
+            let mut read_cells = Vec::new();
+            for (&type_id, cells) in state.cells.iter() {
+                for (index, cell) in cells.iter().enumerate() {
+                    if cell.is_available() {
+                        if !cell.has_dependent_tasks() {
+                            unread_cells += 1;
+                        } else {
+                            let tasks = cell.get_dependent_tasks();
+                            read_cells.push((
+                                CellId {
+                                    type_id,
+                                    index: index as u32,
+                                },
+                                tasks,
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(GcTaskInfo {
+                unread_cells,
+                cells: read_cells,
+                output: state.output.dependent_tasks.iter().copied().collect(),
+                compute_duration: state.stats.last_duration(),
+                age: now_relative_to_start - state.stats.last_execution_relative_to_start(),
+                active: state
+                    .scopes
+                    .iter()
+                    .any(|scope| backend.with_scope(scope, |scope| scope.state.lock().is_active())),
+            })
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn gc_compute_duration(&self) -> Duration {
+        if let TaskMetaStateReadGuard::Full(state) = self.state() {
+            state.stats.last_duration()
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    pub(crate) fn gc(&self, unread_cells: bool, cells: &[CellId]) {
+        assert!(self.is_pure());
+        if let TaskMetaStateWriteGuard::Full(mut state) = self.state_mut() {
+            if unread_cells {
+                for cells in state.cells.values_mut() {
+                    for cell in cells.iter_mut() {
+                        if !cell.has_dependent_tasks() {
+                            cell.gc_content();
+                        }
+                    }
+                }
+            }
+            for &cell in cells {
+                if let Some(cells) = state.cells.get_mut(&cell.type_id) {
+                    if let Some(cell) = cells.get_mut(cell.index as usize) {
+                        cell.gc_content();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn unload(
+        &self,
+        backend: &MemoryBackend,
+        turbo_tasks: &dyn TurboTasksBackendApi,
+    ) -> bool {
+        assert!(self.is_pure());
+        let mut state = self.state.write();
+        if let TaskMetaState::Full(ref mut full_state) = *state {
+            let mut clear_dependencies = None;
+            match full_state.state_type {
+                Done {
+                    ref mut dependencies,
+                } => {
+                    let mut active = false;
+                    for scope in full_state.scopes.iter() {
+                        backend.with_scope(scope, |scope| {
+                            scope.increment_unfinished_tasks(backend);
+                            log_scope_update!(
+                                "add unfinished task (unload): {} -> {}",
+                                *scope.id,
+                                *self.id
+                            );
+                            let mut scope = scope.state.lock();
+                            if scope.is_active() {
+                                active = true;
+                            } else {
+                                scope.add_dirty_task(self.id);
+                            }
+                        });
+                    }
+                    if active {
+                        // Unloading is only possible for inactive tasks.
+                        // We need to abort the unloading, so revert changes done so far.
+                        for scope in full_state.scopes.iter() {
+                            backend.with_scope(scope, |scope| {
+                                scope.decrement_unfinished_tasks(backend);
+                                log_scope_update!(
+                                    "remove unfinished task (undo unload): {} -> {}",
+                                    *scope.id,
+                                    *self.id
+                                );
+                                let mut scope = scope.state.lock();
+                                scope.remove_dirty_task(self.id);
+                            });
+                        }
+                        return false;
+                    }
+                    clear_dependencies = Some(take(dependencies));
+                }
+                Dirty { ref event } => {
+                    // We want to get rid of this Event, so notify it to make sure it's empty.
+                    event.notify(usize::MAX);
+                }
+                _ => {
+                    // Any other state is not unloadable.
+                    return false;
+                }
+            }
+            // Task is now dirty, so we can safely unload it
+
+            let old_state = replace(&mut *state, TaskMetaState::Unloaded(Default::default()));
+            let TaskState {
+                children,
+                cells,
+                output,
+                collectibles,
+                scopes,
+                stats,
+                ..
+            } = old_state.into_unwrap_full();
+
+            // Remove all children, as they will be added again when this task is executed
+            // again
+            if !children.is_empty() {
+                remove_from_scopes(children, &scopes, backend, turbo_tasks);
+            }
+
+            // Remove all collectibles, as they will be added again when this task is
+            // executed again.
+            if let Some(collectibles) = collectibles.into_inner() {
+                remove_collectible_from_scopes(
+                    collectibles.emitted,
+                    collectibles.unemitted,
+                    &scopes,
+                    backend,
+                    turbo_tasks,
+                );
+            }
+
+            let unset = if let TaskScopes::Inner(ref scopes, _) = scopes {
+                scopes.is_unset()
+            } else {
+                false
+            };
+
+            // TODO maybe None, depending on scopes
+            let id = self.id;
+            if unset {
+                *state = TaskMetaState::Unloaded(UnloadedTaskState {
+                    stats_type: match stats {
+                        TaskStats::Essential(_) => StatsType::Essential,
+                        TaskStats::Full(_) => StatsType::Full,
+                    },
+                });
+            } else {
+                *state = TaskMetaState::Partial(box PartialTaskState {
+                    event: Event::new(move || format!("TaskState({id})::event")),
+                    scopes,
+                    stats_type: match stats {
+                        TaskStats::Essential(_) => StatsType::Essential,
+                        TaskStats::Full(_) => StatsType::Full,
+                    },
+                });
+            }
+            drop(state);
+
+            // Notify everyone that is listening on our output or cells.
+            // This will mark everyone as dirty and will trigger a new execution when they
+            // become active again.
+            for cells in cells.into_values() {
+                for cell in cells {
+                    cell.gc_drop(turbo_tasks);
+                }
+            }
+            output.gc_drop(turbo_tasks);
+
+            // We can clear the dependencies as we are already marked as dirty
+            if let Some(dependencies) = clear_dependencies {
+                self.clear_dependencies(dependencies, backend);
+            }
+
+            true
+        } else {
+            false
         }
     }
 }

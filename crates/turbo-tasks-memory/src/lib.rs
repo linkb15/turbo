@@ -8,6 +8,7 @@
 
 mod cell;
 mod count_hash_set;
+mod gc;
 mod map_guard;
 mod memory_backend;
 mod memory_backend_with_pg;

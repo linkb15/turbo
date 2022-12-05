@@ -30,6 +30,12 @@ pub(crate) enum Cell {
     /// reasons.
     #[default]
     Empty,
+    /// The content has been removed for memory pressure reasons, but the
+    /// tracking is still active. Any update will invalidate dependent tasks.
+    TrackedValueless {
+        dependent_tasks: AutoSet<TaskId>,
+        updates: u32,
+    },
     /// Someone wanted to read the content and it was not available. The content
     /// is now being recomputed.
     /// This is only used when there are no dependent tasks
@@ -54,6 +60,16 @@ pub struct RecomputingCell {
 }
 
 impl Cell {
+    pub fn is_available(&self) -> bool {
+        match self {
+            Cell::Empty => false,
+            Cell::Recomputing { .. } | Cell::Full(box FullCell::Recomputing { .. }) => false,
+            Cell::TrackedValueless { .. } => false,
+            Cell::InitialValue { .. } => true,
+            Cell::Full(box FullCell::UpdatedValue { .. }) => true,
+        }
+    }
+
     pub fn remove_dependent_task(&mut self, task: TaskId) {
         match self {
             Cell::Empty
@@ -62,11 +78,48 @@ impl Cell {
             Cell::InitialValue {
                 dependent_tasks, ..
             }
+            | Cell::TrackedValueless {
+                dependent_tasks, ..
+            }
             | Cell::Full(box FullCell::UpdatedValue {
                 dependent_tasks, ..
             }) => {
                 dependent_tasks.remove(&task);
             }
+        }
+    }
+
+    pub fn has_dependent_tasks(&self) -> bool {
+        match self {
+            Cell::Empty
+            | Cell::Recomputing { .. }
+            | Cell::Full(box FullCell::Recomputing { .. }) => false,
+            Cell::InitialValue {
+                dependent_tasks, ..
+            }
+            | Cell::TrackedValueless {
+                dependent_tasks, ..
+            }
+            | Cell::Full(box FullCell::UpdatedValue {
+                dependent_tasks, ..
+            }) => !dependent_tasks.is_empty(),
+        }
+    }
+
+    pub fn get_dependent_tasks(&self) -> Vec<TaskId> {
+        match self {
+            Cell::Empty
+            | Cell::Recomputing { .. }
+            | Cell::Full(box FullCell::Recomputing { .. }) => vec![],
+            Cell::InitialValue {
+                dependent_tasks, ..
+            }
+            | Cell::TrackedValueless {
+                dependent_tasks, ..
+            }
+            | Cell::Full(box FullCell::UpdatedValue {
+                dependent_tasks, ..
+            }) => dependent_tasks.iter().copied().collect(),
         }
     }
 
@@ -119,6 +172,17 @@ impl Cell {
                     schedule: false,
                 })
             }
+            &mut Cell::TrackedValueless {
+                ref mut dependent_tasks,
+                updates,
+            } => {
+                let dependent_tasks = take(dependent_tasks);
+                let listener = self.recompute(updates, dependent_tasks, description, note);
+                Err(RecomputingCell {
+                    listener,
+                    schedule: true,
+                })
+            }
             Cell::InitialValue {
                 content,
                 dependent_tasks,
@@ -164,6 +228,17 @@ impl Cell {
                     schedule: false,
                 })
             }
+            &mut Cell::TrackedValueless {
+                ref mut dependent_tasks,
+                updates,
+            } => {
+                let dependent_tasks = take(dependent_tasks);
+                let listener = self.recompute(updates, dependent_tasks, description, note);
+                Err(RecomputingCell {
+                    listener,
+                    schedule: true,
+                })
+            }
             Cell::InitialValue { content, .. }
             | Cell::Full(box FullCell::UpdatedValue { content, .. }) => Ok(content.clone()),
         }
@@ -175,6 +250,7 @@ impl Cell {
         match self {
             Cell::Empty
             | Cell::Recomputing { .. }
+            | Cell::TrackedValueless { .. }
             | Cell::Full(box FullCell::Recomputing { .. }) => CellContent(None),
             Cell::InitialValue { content, .. }
             | Cell::Full(box FullCell::UpdatedValue { content, .. }) => content.clone(),
@@ -197,6 +273,9 @@ impl Cell {
             Cell::Full(box FullCell::Recomputing {
                 dependent_tasks, ..
             })
+            | Cell::TrackedValueless {
+                dependent_tasks, ..
+            }
             | Cell::InitialValue {
                 dependent_tasks, ..
             }
@@ -256,6 +335,27 @@ impl Cell {
                     };
                 }
             }
+            &mut Cell::TrackedValueless {
+                ref mut dependent_tasks,
+                updates,
+            } => {
+                if !dependent_tasks.is_empty() {
+                    turbo_tasks.schedule_notify_tasks_set(&dependent_tasks);
+                    dependent_tasks.clear();
+                }
+                if updates == 1 {
+                    *self = Cell::InitialValue {
+                        content,
+                        dependent_tasks: take(dependent_tasks),
+                    };
+                } else {
+                    *self = Cell::Full(box FullCell::UpdatedValue {
+                        content,
+                        dependent_tasks: take(dependent_tasks),
+                        updates,
+                    });
+                }
+            }
             Cell::InitialValue {
                 content: old_content,
                 dependent_tasks,
@@ -284,6 +384,56 @@ impl Cell {
                     }
                     *updates += 1;
                     *cell_content = content;
+                }
+            }
+        }
+    }
+
+    pub fn gc_content(&mut self) {
+        match self {
+            Cell::Empty
+            | Cell::Recomputing { .. }
+            | Cell::Full(box FullCell::Recomputing { .. })
+            | Cell::TrackedValueless { .. } => {}
+            Cell::InitialValue {
+                dependent_tasks, ..
+            } => {
+                *self = Cell::TrackedValueless {
+                    dependent_tasks: take(dependent_tasks),
+                    updates: 1,
+                };
+            }
+            &mut Cell::Full(box FullCell::UpdatedValue {
+                ref mut dependent_tasks,
+                updates,
+                ..
+            }) => {
+                *self = Cell::TrackedValueless {
+                    dependent_tasks: take(dependent_tasks),
+                    updates,
+                };
+            }
+        }
+    }
+
+    pub fn gc_drop(self, turbo_tasks: &dyn TurboTasksBackendApi) {
+        match self {
+            Cell::Empty | Cell::Recomputing { .. } => {}
+            Cell::Full(box FullCell::Recomputing {
+                dependent_tasks, ..
+            })
+            | Cell::TrackedValueless {
+                dependent_tasks, ..
+            }
+            | Cell::InitialValue {
+                dependent_tasks, ..
+            }
+            | Cell::Full(box FullCell::UpdatedValue {
+                dependent_tasks, ..
+            }) => {
+                // notify
+                if !dependent_tasks.is_empty() {
+                    turbo_tasks.schedule_notify_tasks_set(&dependent_tasks);
                 }
             }
         }
