@@ -48,13 +48,13 @@ turbo-tasks-memory = { path = "../turbo-tasks-memory" }
 turbopack-cli-utils = { path = "../turbopack-cli-utils" }
 turbopack-core = { path = "../turbopack-core" }
 turbopack-dev-server = { path = "../turbopack-dev-server" }
-webbrowser = "0.7.1"
+webbrowser = "0.8.2"
 
 [dev-dependencies]
 chromiumoxide = { version = "0.4.0", features = [
   "tokio-runtime",
 ], default-features = false }
-criterion = { version = "0.3.5", features = ["async_tokio"] }
+criterion = { version = "0.4.0", features = ["async_tokio"] }
 fs_extra = "1.2.0"
 lazy_static = "1.4.0"
 once_cell = "1.13.0"
@@ -73,7 +73,7 @@ turbopack-create-test-app = { path = "../turbopack-create-test-app" }
 url = "2.2.2"
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = "0.25.0"
+nix = "0.26.1"
 
 [build-dependencies]
 turbo-tasks-build = { path = "../turbo-tasks-build" }
