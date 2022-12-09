@@ -8,6 +8,7 @@ use swc_core::{
     common::{chain, util::take::Take, FileName, Mark, SourceMap},
     ecma::{
         ast::{Module, ModuleItem, Program},
+        atoms::JsWord,
         preset_env::{self, Targets},
         transforms::{
             base::{feature::FeatureFlag, helpers::inject_helpers, resolver, Assumptions},
@@ -35,7 +36,7 @@ pub enum EcmascriptInputTransform {
     ///
     /// It also provides diagnostics for improper use of `getServerSideProps`.
     NextJsPageSsr,
-    NextJsFont,
+    NextJsFont(NextJsFontLoadersVc),
     PresetEnv(EnvironmentVc),
     React {
         #[serde(default)]
@@ -45,6 +46,10 @@ pub enum EcmascriptInputTransform {
     StyledJsx,
     TypeScript,
 }
+
+#[turbo_tasks::value(transparent)]
+#[derive(Debug)]
+pub struct NextJsFontLoaders(Vec<StringVc>);
 
 #[turbo_tasks::value(transparent, serialization = "auto_for_input")]
 #[derive(Debug, PartialOrd, Ord, Hash, Clone)]
@@ -181,9 +186,14 @@ impl EcmascriptInputTransform {
 
                 *program = module_program.fold_with(&mut next_ssg(eliminated_packages));
             }
-            EcmascriptInputTransform::NextJsFont => {
+            EcmascriptInputTransform::NextJsFont(font_loaders_vc) => {
+                let mut font_loaders = vec![];
+                for loader in &(*font_loaders_vc.await?) {
+                    font_loaders.push(std::convert::Into::<JsWord>::into(&**loader.await?));
+                }
+
                 let mut next_font = next_font::next_font_loaders(next_font::Config {
-                    font_loaders: vec!["@next/font/google".into(), "@next/font/local".into()],
+                    font_loaders,
                     relative_file_path_from_root: file_name_str.into(),
                 });
 

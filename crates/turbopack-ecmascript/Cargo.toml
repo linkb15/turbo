@@ -69,3 +69,6 @@ turbo-tasks-build = { path = "../turbo-tasks-build" }
 [[bench]]
 name = "mod"
 harness = false
+
+[features]
+next-font-local = []
