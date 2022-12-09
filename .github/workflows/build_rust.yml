@@ -88,6 +88,7 @@ jobs:
           #  "fail", "warn", "ignore"
           # default fail
           if_no_artifact_found: fail
+          search_artifacts: true
 
       # TODO: re-enable this instead of the above when this runs together with the go library build
       # - name: Download Cross-compiled Artifacts
